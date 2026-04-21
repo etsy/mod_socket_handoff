@@ -82,6 +82,9 @@ type HandoffData struct {
 	// Per-request backend selection (overrides the daemon's default provider)
 	Backend string `json:"backend,omitempty"`
 
+	// Redis pub/sub fields
+	SubjectID int64 `json:"subject_id,omitempty"`
+
 	// Image handoff fields (for multimodal requests)
 	// Legacy single-image fields (deprecated, use Images/ImagePaths instead)
 	ImagePath     string `json:"image_path,omitempty"`      // Deprecated: use ImagePaths

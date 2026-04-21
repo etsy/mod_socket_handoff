@@ -42,6 +42,7 @@ type BackendConfig struct {
 	LangGraph LangGraphConfig `yaml:"langgraph"`
 	Mock      MockConfig      `yaml:"mock"`
 	Typing    TypingConfig    `yaml:"typing"`
+	Redis     RedisConfig     `yaml:"redis"`
 }
 
 // OpenAIConfig contains OpenAI-compatible API settings.
@@ -90,6 +91,12 @@ type MockConfig struct {
 type TypingConfig struct {
 	UseAPI       bool   `yaml:"use_api"`
 	DefaultModel string `yaml:"default_model"`
+}
+
+// RedisConfig contains Redis pub/sub backend settings.
+type RedisConfig struct {
+	Addr     string `yaml:"addr"`     // host:port, default 127.0.0.1:6379
+	Password string `yaml:"password"` // optional
 }
 
 // MetricsConfig contains Prometheus metrics settings.
@@ -296,6 +303,9 @@ func Default() *Config {
 			},
 			Mock: MockConfig{
 				MessageDelayMs: 50,
+			},
+			Redis: RedisConfig{
+				Addr: "127.0.0.1:6379",
 			},
 		},
 		Metrics: MetricsConfig{
