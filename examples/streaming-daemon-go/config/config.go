@@ -86,10 +86,11 @@ type BackendConfig struct {
 	DefaultModel string `yaml:"default_model"`
 
 	// Backend-specific configuration sections
-	OpenAI    OpenAIConfig    `yaml:"openai"`
-	LangGraph LangGraphConfig `yaml:"langgraph"`
-	Mock      MockConfig      `yaml:"mock"`
-	Typing    TypingConfig    `yaml:"typing"`
+	OpenAI      OpenAIConfig      `yaml:"openai"`
+	LangGraph   LangGraphConfig   `yaml:"langgraph"`
+	Mock        MockConfig        `yaml:"mock"`
+	Typing      TypingConfig      `yaml:"typing"`
+	NoopMonitor NoopMonitorConfig `yaml:"noop_monitor"`
 }
 
 // OpenAIConfig contains OpenAI-compatible API settings.
@@ -138,6 +139,11 @@ type MockConfig struct {
 type TypingConfig struct {
 	UseAPI       bool   `yaml:"use_api"`
 	DefaultModel string `yaml:"default_model"`
+}
+
+// NoopMonitorConfig contains noop-monitor backend settings.
+type NoopMonitorConfig struct {
+	PingIntervalMs int `yaml:"ping_interval_ms"` // keepalive interval; 0 = default (25000)
 }
 
 // MetricsConfig contains Prometheus metrics settings.
@@ -293,6 +299,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("backend.mock.message_delay_ms must be non-negative")
 	}
 
+	// Validate noop-monitor backend
+	if c.Backend.NoopMonitor.PingIntervalMs < 0 {
+		return fmt.Errorf("backend.noop_monitor.ping_interval_ms must be non-negative")
+	}
+
 	return nil
 }
 
@@ -390,6 +401,9 @@ func Default() *Config {
 			},
 			Mock: MockConfig{
 				MessageDelayMs: 50,
+			},
+			NoopMonitor: NoopMonitorConfig{
+				PingIntervalMs: 25000,
 			},
 		},
 		Metrics: MetricsConfig{

@@ -65,6 +65,11 @@ backend:
   # Typing backend configuration
   typing: {}
 
+  # Noop-monitor backend configuration (connection monitor).
+  # Holds connections open sending only keepalives; measurement is via metrics.
+  noop_monitor:
+    ping_interval_ms: 25000  # Keepalive interval (also the disconnect-detection cadence)
+
 metrics:
   enabled: true
   listen_addr: 127.0.0.1:9090
