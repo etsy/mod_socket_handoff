@@ -8,51 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
-)
-
-const (
-	// Socket path - must match SocketHandoffAllowedPrefix in Apache config
-	DaemonSocket = "/run/streaming-daemon.sock"
-
-	// Timeouts for robustness
-	HandoffTimeout  = 5 * time.Second // Max time to receive fd from Apache
-	ShutdownTimeout = 2 * time.Minute // Graceful shutdown timeout; long enough for LLM streams to complete
-	// DrainCancelGrace is how long to wait after cancelling the streams that
-	// outlived ShutdownTimeout, so backends can send an SSE error event and exit.
-	DrainCancelGrace = 5 * time.Second
-
-	// DefaultMaxConnections is the default maximum concurrent connections.
-	// Can be overridden with -max-connections flag for benchmarking.
-	DefaultMaxConnections = 50000
-
-	// MaxHandoffDataSize is the buffer size for receiving handoff JSON from Apache
-	// via the Unix socket. The data originates from the X-Handoff-Data response
-	// header set by PHP. Apache has no size limit on response headers, so the
-	// effective limit is this buffer size and the kernel's SO_SNDBUF (~208KB
-	// default on Linux) which caps SOCK_SEQPACKET message size. Increase if needed.
-	MaxHandoffDataSize = 131072 // 128KB
-
-	// DefaultMetricsAddr is the default address for the Prometheus metrics HTTP server.
-	DefaultMetricsAddr = "127.0.0.1:9090"
-
-	// DefaultSocketMode is the default permission mode for the Unix socket.
-	// 0660 restricts access to owner and group only. Apache (www-data) must be
-	// in the same group as the daemon, or run the daemon as www-data.
-	DefaultSocketMode = 0660
-
-	// DefaultDataDirMaxAgeMs is how long a staged attachment file may sit in
-	// DataDir before the sweeper removes it (10 minutes). Files are normally
-	// deleted as soon as they are consumed; the sweeper only catches leftovers
-	// from requests that failed before reaching attachment resolution.
-	DefaultDataDirMaxAgeMs = 10 * 60 * 1000
-
-	// MaxTotalAttachmentBytes caps the combined on-disk size of all attachments
-	// and image files referenced by one handoff (32 MiB). Individual files are
-	// also capped (see maxTextFileSize / maxBinaryFileSize in the daemon).
-	MaxTotalAttachmentBytes = 32 << 20
 )
 
 // Config is the root configuration structure.
@@ -70,14 +27,9 @@ type ServerConfig struct {
 	MaxConnections      int    `yaml:"max_connections"`
 	MaxStreamDurationMs int    `yaml:"max_stream_duration_ms"`
 	PprofAddr           string `yaml:"pprof_addr"`
-	MemLimit            string `yaml:"mem_limit"`  // Soft memory limit, e.g. "768MiB", "1GiB"
+	MemLimit            string `yaml:"mem_limit"`   // Soft memory limit, e.g. "768MiB", "1GiB"
 	GCPercent           int    `yaml:"gc_percent"` // GOGC value; 0 = not set (use -gc-percent flag for GOGC=0)
 	DataDir             string `yaml:"data_dir"`   // Allowed directory for attachment file reads (default: /run/handoff-data)
-
-	// DataDirMaxAgeMs is the age after which staged files left behind in DataDir
-	// (from requests that failed before their attachments were consumed) are
-	// removed by the background sweeper. 0 disables the sweeper.
-	DataDirMaxAgeMs int `yaml:"data_dir_max_age_ms"`
 }
 
 // BackendConfig contains backend selection and configuration.
@@ -176,11 +128,6 @@ func Load(path string) (*Config, error) {
 // Omitted string fields will be empty; note that bool/int zero values are
 // indistinguishable from explicitly set false/0.
 // Used by reloadConfig() to detect which string fields were explicitly set.
-//
-// Only the hot-reloadable fields are validated (see ValidateReloadable). Running
-// the full Validate() here would reject files that are perfectly valid at
-// startup, because defaults are not applied (e.g. metrics.enabled without
-// listen_addr, or an omitted max_connections).
 func LoadRaw(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -192,63 +139,21 @@ func LoadRaw(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 
-	if err := cfg.ValidateReloadable(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
 	return &cfg, nil
 }
 
-// ValidateReloadable checks only the fields that reloadConfig() applies at
-// runtime: memory limit, GC percent, and logging. It is safe to call on a
-// config without defaults applied.
-func (c *Config) ValidateReloadable() error {
-	// Validate memory limit format early so config-file typos are caught at load time
-	if c.Server.MemLimit != "" {
-		if ParseMemLimit(c.Server.MemLimit) <= 0 {
-			return fmt.Errorf("server.mem_limit: invalid value %q (expected positive integer with optional suffix: B, K, KB, KiB, M, MB, MiB, G, GB, GiB, T, TB, TiB, or no suffix)", c.Server.MemLimit)
-		}
-	}
-
-	// Validate GC percent: negative values have special meaning in the Go runtime
-	// (e.g. -1 disables the GOGC knob entirely), so reject them in config to avoid
-	// surprising behavior. Use the -gc-percent flag for advanced runtime tuning.
-	if c.Server.GCPercent < 0 {
-		return fmt.Errorf("server.gc_percent must be non-negative")
-	}
-
-	switch strings.ToLower(c.Logging.Level) {
-	case "", "debug", "info", "warn", "warning", "error":
-	default:
-		return fmt.Errorf("logging.level must be one of debug, info, warn, warning, error; got %q", c.Logging.Level)
-	}
-	switch strings.ToLower(c.Logging.Format) {
-	case "", "text", "json":
-	default:
-		return fmt.Errorf("logging.format must be \"text\" or \"json\"; got %q", c.Logging.Format)
-	}
-
-	return nil
-}
-
 // Validate checks the configuration for errors.
 func (c *Config) Validate() error {
-	// Validate server config.
-	// max_connections sizes the connection semaphore; 0 would make it unbuffered
-	// and reject every connection, so it must be strictly positive.
-	if c.Server.MaxConnections <= 0 {
-		return fmt.Errorf("server.max_connections must be positive")
+	// Validate server config
+	if c.Server.MaxConnections < 0 {
+		return fmt.Errorf("server.max_connections must be non-negative")
 	}
 	if c.Server.MaxStreamDurationMs < 0 {
 		return fmt.Errorf("server.max_stream_duration_ms must be non-negative")
-	}
-	if c.Server.DataDirMaxAgeMs < 0 {
-		return fmt.Errorf("server.data_dir_max_age_ms must be non-negative")
-	}
-	// socket_mode is a permission bitmask; anything above 0777 is a typo such as
-	// writing decimal 660 instead of octal 0660.
-	if c.Server.SocketMode > 0777 {
-		return fmt.Errorf("server.socket_mode must be an octal permission mode <= 0777 (write it with a leading zero, e.g. 0660); got %o", c.Server.SocketMode)
 	}
 
 	// Validate socket paths for security.
@@ -283,9 +188,18 @@ func (c *Config) Validate() error {
 	// Note: Backend provider validation is done in main.go against registered backends
 	// to avoid circular imports between config and backends packages.
 
-	// Hot-reloadable fields (mem_limit, gc_percent, logging)
-	if err := c.ValidateReloadable(); err != nil {
-		return err
+	// Validate memory limit format early so config-file typos are caught at load time
+	if c.Server.MemLimit != "" {
+		if ParseMemLimit(c.Server.MemLimit) <= 0 {
+			return fmt.Errorf("server.mem_limit: invalid value %q (expected positive integer with optional suffix: B, K, KB, KiB, M, MB, MiB, G, GB, GiB, T, TB, TiB, or no suffix)", c.Server.MemLimit)
+		}
+	}
+
+	// Validate GC percent: negative values have special meaning in the Go runtime
+	// (e.g. -1 disables the GOGC knob entirely), so reject them in config to avoid
+	// surprising behavior. Use the -gc-percent flag for advanced runtime tuning.
+	if c.Server.GCPercent < 0 {
+		return fmt.Errorf("server.gc_percent must be non-negative")
 	}
 
 	// Validate mock backend
@@ -356,37 +270,29 @@ func ParseMemLimit(s string) int64 {
 	return int64(num * multiplier)
 }
 
-// boolPtr returns a fresh pointer to v. Each *bool config field must get its
-// own allocation: yaml.v3 decodes into an existing pointee in place, so a
-// shared pointer would make openai.http2_enabled and langgraph.http2_enabled
-// overwrite each other.
-func boolPtr(v bool) *bool {
-	return &v
-}
-
 // Default returns a Config with sensible defaults.
 func Default() *Config {
+	http2 := true
 	return &Config{
 		Server: ServerConfig{
-			SocketPath:          DaemonSocket,
-			SocketMode:          DefaultSocketMode,
-			MaxConnections:      DefaultMaxConnections,
+			SocketPath:          "/run/streaming-daemon.sock",
+			SocketMode:          0660,
+			MaxConnections:      50000,
 			MaxStreamDurationMs: 300000,
 			DataDir:             "/run/handoff-data",
-			DataDirMaxAgeMs:     DefaultDataDirMaxAgeMs,
 		},
 		Backend: BackendConfig{
 			Provider:     "mock",
 			DefaultModel: "gpt-4o-mini",
 			OpenAI: OpenAIConfig{
 				APIBase:      "https://api.openai.com/v1",
-				HTTP2Enabled: boolPtr(true),
+				HTTP2Enabled: &http2,
 			},
 			LangGraph: LangGraphConfig{
 				APIBase:      "https://api.langchain.com/v1",
 				AssistantID:  "agent",
 				StreamMode:   "messages-tuple",
-				HTTP2Enabled: boolPtr(true),
+				HTTP2Enabled: &http2,
 			},
 			Mock: MockConfig{
 				MessageDelayMs: 50,
@@ -394,7 +300,7 @@ func Default() *Config {
 		},
 		Metrics: MetricsConfig{
 			Enabled:    true,
-			ListenAddr: DefaultMetricsAddr,
+			ListenAddr: "127.0.0.1:9090",
 		},
 		Logging: LoggingConfig{
 			Level:  "info",

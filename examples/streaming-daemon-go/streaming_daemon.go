@@ -6,12 +6,12 @@
  * for integrating with LLM APIs or other streaming services.
  *
  * Build:
- *   make                      (or: go build -o streaming-daemon .)
+ *   go build -o streaming-daemon streaming_daemon.go
  *
  * Run:
- *   ./streaming-daemon -config config/local.yaml
+ *   sudo ./streaming-daemon
  *
- * See README.md for configuration, signals and systemd notes.
+ * Or install as systemd service - see streaming-daemon.service
  */
 
 package main
@@ -33,7 +33,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +46,35 @@ import (
 
 	"examples/backends"
 	"examples/config"
+)
+
+const (
+	// Socket path - must match SocketHandoffAllowedPrefix in Apache config
+	DaemonSocket = "/run/streaming-daemon.sock"
+
+	// Timeouts for robustness
+	HandoffTimeout  = 5 * time.Second // Max time to receive fd from Apache
+	ShutdownTimeout = 2 * time.Minute // Graceful shutdown timeout; long enough for LLM streams to complete
+
+	// DefaultMaxConnections is the default maximum concurrent connections.
+	// Can be overridden with -max-connections flag for benchmarking.
+	DefaultMaxConnections = 50000
+
+	// MaxHandoffDataSize is the buffer size for receiving handoff JSON from Apache
+	// via the Unix socket. The data originates from the X-Handoff-Data response
+	// header set by PHP. Apache has no size limit on response headers, so the
+	// effective limit is this buffer size and the kernel's SO_SNDBUF (~208KB
+	// default on Linux) which caps SOCK_SEQPACKET message size. Increase if needed.
+	MaxHandoffDataSize = 131072 // 128KB
+
+	// DefaultMetricsAddr is the default address for the Prometheus metrics HTTP server.
+	DefaultMetricsAddr = "127.0.0.1:9090"
+
+	// DefaultSocketMode is the default permission mode for the Unix socket.
+	// 0660 restricts access to owner and group only. Apache (www-data) must be
+	// in the same group as the daemon, or run the daemon as www-data.
+	DefaultSocketMode = 0660
+
 )
 
 // Command-line flags
@@ -142,6 +170,7 @@ func (b *BenchmarkStats) print() {
 	fmt.Println("=========================")
 }
 
+
 // Prometheus metrics
 var (
 	metricActiveConnections = promauto.NewGauge(prometheus.GaugeOpts{
@@ -202,11 +231,12 @@ var (
 	})
 )
 
+
 // Connection tracking for graceful shutdown
 var (
-	activeConns   int64
-	activeStreams int64
-	peakStreams   int64
+	activeConns    int64
+	activeStreams  int64
+	peakStreams    int64
 	connSemaphore chan struct{}
 	connWg        sync.WaitGroup
 )
@@ -215,7 +245,7 @@ var (
 // memory pressure and GC overhead under high connection throughput.
 var handoffBufPool = sync.Pool{
 	New: func() any {
-		buf := make([]byte, config.MaxHandoffDataSize)
+		buf := make([]byte, MaxHandoffDataSize)
 		return &buf
 	},
 }
@@ -300,11 +330,7 @@ func isValidHeaderValue(value string) bool {
 	return true
 }
 
-// writeAll writes the entire buffer to conn. The io.Writer contract requires
-// a non-nil error on a short write and the standard net.Conn implementations
-// honour it, but this is used for status lines and headers where a truncated
-// write from a misbehaving wrapped conn would yield a malformed response, so
-// it loops defensively and treats a no-progress write as an error.
+// writeAll writes the entire buffer to conn, handling short writes.
 func writeAll(conn net.Conn, buf []byte) (int64, error) {
 	var written int64
 	for len(buf) > 0 {
@@ -316,6 +342,8 @@ func writeAll(conn net.Conn, buf []byte) (int64, error) {
 		if err != nil {
 			return written, err
 		}
+		// Guard against no-progress writes (n == 0, err == nil), which are
+		// permitted by io.Writer and would otherwise cause an infinite loop.
 		if n == 0 {
 			return written, io.ErrShortWrite
 		}
@@ -323,82 +351,13 @@ func writeAll(conn net.Conn, buf []byte) (int64, error) {
 	return written, nil
 }
 
-// writeErrorResponse writes a complete non-streaming HTTP error response
-// (status line, minimal headers, plain-text body) with a write deadline.
-// extraHeaders are complete "Name: value" lines appended before the body.
-func writeErrorResponse(conn net.Conn, status, body string, extraHeaders ...string) (int64, error) {
-	if err := conn.SetWriteDeadline(time.Now().Add(backends.WriteTimeout)); err != nil {
-		return 0, fmt.Errorf("could not set write deadline: %w", err)
-	}
-	buf := make([]byte, 0, 160+len(body))
-	buf = append(buf, "HTTP/1.1 "...)
-	buf = append(buf, status...)
-	buf = append(buf, "\r\nContent-Type: text/plain\r\nContent-Length: "...)
-	buf = strconv.AppendInt(buf, int64(len(body)), 10)
-	buf = append(buf, "\r\nConnection: close\r\n"...)
-	for _, h := range extraHeaders {
-		buf = append(buf, h...)
-		buf = append(buf, "\r\n"...)
-	}
-	buf = append(buf, "\r\n"...)
-	buf = append(buf, body...)
-	return writeAll(conn, buf)
-}
-
-// lazyHeaderConn defers the HTTP status line and SSE headers until the backend
-// writes its first byte. Backends contact upstream (connect, authenticate,
-// possibly create a thread) before they have anything to send; if that fails,
-// nothing has reached the client yet and the daemon can still answer with a
-// real 502/504 instead of an empty "200 text/event-stream" that just closes.
-// The headers ride in the same writev() as the first chunk on TCP connections.
-type lazyHeaderConn struct {
-	net.Conn
-	handoff     backends.HandoffData
-	headersSent bool
-	headerBytes int64
-}
-
-func (c *lazyHeaderConn) Write(p []byte) (int, error) {
-	if c.headersSent {
-		return c.Conn.Write(p)
-	}
-	// headersSent stays true even if the write fails part-way: once any byte of
-	// the status line is on the wire, a retry would emit a second status line
-	// into a partially written response, so the caller must abort instead.
-	c.headersSent = true
-	hdr := buildSSEHeaders(c.handoff)
-	bufs := net.Buffers{hdr, p}
-	n, err := bufs.WriteTo(c.Conn)
-	if err == nil && n < int64(len(hdr)+len(p)) {
-		// The generic WriteTo path does not check for short writes itself.
-		err = io.ErrShortWrite
-	}
-	if n >= int64(len(hdr)) {
-		c.headerBytes = int64(len(hdr))
-		n -= int64(len(hdr))
-	} else {
-		c.headerBytes = n
-		n = 0
-	}
-	if err != nil {
-		return int(n), fmt.Errorf("failed to write headers: %w", err)
-	}
-	return int(n), nil
-}
-
 // writeSSEHeaders writes the HTTP response status line and headers to conn.
+// When handoff.ResponseHeaders is non-empty, custom headers are appended after
+// the standard SSE headers. Headers that conflict with SSE framing or have
+// invalid names/values are silently dropped.
 func writeSSEHeaders(conn net.Conn, handoff backends.HandoffData) (int64, error) {
-	return writeAll(conn, buildSSEHeaders(handoff))
-}
-
-// buildSSEHeaders returns the HTTP response status line and headers for an SSE
-// response. When handoff.ResponseHeaders is non-empty, custom headers are
-// appended after the standard SSE headers. Headers that conflict with SSE
-// framing or have invalid names/values are silently dropped. The returned
-// slice must not be modified when it aliases the shared sseHeadersBytes.
-func buildSSEHeaders(handoff backends.HandoffData) []byte {
 	if len(handoff.ResponseHeaders) == 0 {
-		return sseHeadersBytes
+		return writeAll(conn, sseHeadersBytes)
 	}
 
 	// Collect valid custom headers first to avoid allocating a buffer
@@ -414,7 +373,7 @@ func buildSSEHeaders(handoff backends.HandoffData) []byte {
 
 	// If no custom headers survived validation, use the fast path.
 	if len(valid) == 0 {
-		return sseHeadersBytes
+		return writeAll(conn, sseHeadersBytes)
 	}
 
 	// Build response with custom headers.
@@ -429,7 +388,7 @@ func buildSSEHeaders(handoff backends.HandoffData) []byte {
 	}
 	buf = append(buf, '\r', '\n') // End of headers.
 
-	return buf
+	return writeAll(conn, buf)
 }
 
 // initLogging configures the default slog logger based on LoggingConfig.
@@ -656,26 +615,14 @@ func main() {
 	} else {
 		desiredLimit := uint64(cfg.Server.MaxConnections + 2000)
 		if rLimit.Cur < desiredLimit {
-			newLimit := rLimit
-			newLimit.Cur = desiredLimit
-			if newLimit.Max < desiredLimit {
-				newLimit.Max = desiredLimit
+			rLimit.Cur = desiredLimit
+			if rLimit.Max < desiredLimit {
+				rLimit.Max = desiredLimit
 			}
-			err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &newLimit)
-			if err != nil && newLimit.Max != rLimit.Max {
-				// Raising the hard limit needs CAP_SYS_RESOURCE. Fall back to the
-				// most the existing hard limit allows rather than giving up entirely.
-				newLimit.Max = rLimit.Max
-				newLimit.Cur = rLimit.Max
-				err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &newLimit)
-			}
-			if err != nil {
-				slog.Warn("could not raise fd limit", "desired", desiredLimit, "error", err, "current", rLimit.Cur, "hard", rLimit.Max)
-			} else if newLimit.Cur < desiredLimit {
-				slog.Warn("fd limit raised to hard limit only; raise the hard limit (LimitNOFILE / ulimit -Hn) for full capacity",
-					"limit", newLimit.Cur, "desired", desiredLimit)
+			if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+				slog.Warn("could not set fd limit", "desired", desiredLimit, "error", err, "current", rLimit.Cur)
 			} else {
-				slog.Info("increased fd limit", "limit", newLimit.Cur)
+				slog.Info("increased fd limit", "limit", desiredLimit)
 			}
 		}
 	}
@@ -688,13 +635,6 @@ func main() {
 	// so context.Cause(ctx) returns the signal after cancellation.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	// In-flight streams run under drainCtx, not the signal context: a SIGTERM
-	// must stop accepting new work, not abort every response mid-stream.
-	// drainCtx is cancelled only if streams are still running when
-	// ShutdownTimeout expires.
-	drainCtx, drainCancel := context.WithCancel(context.Background())
-	defer drainCancel()
 
 	// SIGHUP triggers config reload on a separate channel
 	sighupChan := make(chan os.Signal, 1)
@@ -749,13 +689,8 @@ func main() {
 		}
 	}
 
-	// Create Unix socket listener (SOCK_SEQPACKET for atomic message delivery).
-	// The socket inode is created with the process umask applied, and the chmod
-	// below only runs afterwards; tighten the umask for the bind so the socket
-	// is never briefly more permissive than socket_mode.
-	oldUmask := syscall.Umask(0777 &^ int(cfg.Server.SocketMode))
+	// Create Unix socket listener (SOCK_SEQPACKET for atomic message delivery)
 	listener, err := net.Listen("unixpacket", cfg.Server.SocketPath)
-	syscall.Umask(oldUmask)
 	if err != nil {
 		slog.Error("failed to listen", "path", cfg.Server.SocketPath, "error", err)
 		os.Exit(1)
@@ -772,13 +707,6 @@ func main() {
 	}
 
 	slog.Info("streaming daemon listening", "socket", cfg.Server.SocketPath, "max_connections", cfg.Server.MaxConnections)
-
-	// Sweep stale staged attachment files. Requests normally delete their files
-	// as they consume them; this catches leftovers from requests that failed
-	// earlier (malformed JSON, rejected at capacity, crashed mid-resolve).
-	if dataDir != "" && cfg.Server.DataDirMaxAgeMs > 0 {
-		go runDataDirSweeper(ctx, dataDir, time.Duration(cfg.Server.DataDirMaxAgeMs)*time.Millisecond)
-	}
 
 	// Start Prometheus metrics server (keep reference for graceful shutdown)
 	var metricsServer *http.Server
@@ -836,7 +764,9 @@ func main() {
 			// Check if context is cancelled before processing connection
 			select {
 			case <-ctx.Done():
-				connWg.Go(func() { rejectHandoff(conn, "shutting down") })
+				if err := conn.Close(); err != nil {
+					slog.Error("error closing connection during shutdown", "error", err)
+				}
 				return
 			default:
 			}
@@ -861,19 +791,22 @@ func main() {
 					// Check context again inside goroutine to handle race condition
 					select {
 					case <-ctx.Done():
-						rejectHandoff(conn, "shutting down")
+						if err := conn.Close(); err != nil {
+							slog.Error("error closing connection during shutdown", "error", err)
+						}
 						return
 					default:
 					}
-					safeHandleConnection(drainCtx, conn)
+					safeHandleConnection(ctx, conn)
 				})
 			default:
 				if !*benchmarkMode {
 					metricConnectionsRejected.Inc()
 				}
 				slog.Warn("connection limit reached, rejecting", "max", cfg.Server.MaxConnections)
-				// Tell the client rather than dropping it; bounded by HandoffTimeout.
-				connWg.Go(func() { rejectHandoff(conn, "connection limit reached") })
+				if err := conn.Close(); err != nil {
+					slog.Error("error closing rejected connection", "error", err)
+				}
 				// Back off slightly to avoid tight accept-reject loops under overload,
 				// but exit promptly if context is cancelled.
 				select {
@@ -886,9 +819,6 @@ func main() {
 	}()
 
 	<-ctx.Done()
-	// Restore default signal handling so a second SIGINT/SIGTERM during the
-	// drain terminates the process immediately instead of being swallowed.
-	stop()
 	slog.Info("shutting down", "cause", context.Cause(ctx))
 
 	// Close listener to unblock accept loop immediately. The defer above is kept
@@ -915,9 +845,7 @@ func main() {
 		}
 	}
 
-	// Wait for active streams to finish. They keep running under drainCtx;
-	// only if they outlive ShutdownTimeout are they cancelled, which makes
-	// backends return promptly and lets the client see an SSE error event.
+	// Wait for active connections to finish
 	slog.Info("waiting for active connections to finish", "count", atomic.LoadInt64(&activeConns))
 	done := make(chan struct{})
 	go func() {
@@ -928,15 +856,8 @@ func main() {
 	select {
 	case <-done:
 		slog.Info("all connections closed gracefully")
-	case <-time.After(config.ShutdownTimeout):
-		slog.Warn("timeout waiting for connections, cancelling remaining streams", "still_active", atomic.LoadInt64(&activeConns))
-		drainCancel()
-		select {
-		case <-done:
-			slog.Info("remaining streams cancelled")
-		case <-time.After(config.DrainCancelGrace):
-			slog.Warn("streams did not exit after cancellation", "still_active", atomic.LoadInt64(&activeConns))
-		}
+	case <-time.After(ShutdownTimeout):
+		slog.Warn("timeout waiting for connections", "still_active", atomic.LoadInt64(&activeConns))
 	}
 
 	// Print benchmark summary if in benchmark mode
@@ -949,41 +870,6 @@ func main() {
 		slog.Warn("failed to remove socket file", "path", cfg.Server.SocketPath, "error", err)
 	}
 	slog.Info("daemon stopped")
-}
-
-// rejectHandoff answers a handed-off client that the daemon cannot serve
-// (capacity limit or shutdown) with a 503, then closes everything.
-//
-// Simply closing the Apache-side SEQPACKET socket is not an option: the kernel
-// would discard the queued SCM_RIGHTS fd, and Apache has already swapped in a
-// dummy socket and marked its connection aborted, so nobody would ever answer
-// the browser (it sees ERR_EMPTY_RESPONSE). Receiving the fd costs one
-// recvmsg and lets us send a proper status with Retry-After.
-func rejectHandoff(conn net.Conn, reason string) {
-	defer conn.Close()
-
-	clientFd, _, err := receiveFd(conn)
-	if err != nil {
-		slog.Debug("reject: could not receive fd", "reason", reason, "error", err)
-		return
-	}
-	clientFile := os.NewFile(uintptr(clientFd), "rejected-client")
-	if clientFile == nil {
-		syscall.Close(clientFd)
-		return
-	}
-	clientConn, err := net.FileConn(clientFile)
-	clientFile.Close()
-	if err != nil {
-		slog.Debug("reject: could not wrap client fd", "reason", reason, "error", err)
-		return
-	}
-	defer clientConn.Close()
-
-	if _, err := writeErrorResponse(clientConn, "503 Service Unavailable",
-		"Service temporarily unavailable, please retry\n", "Retry-After: 1"); err != nil {
-		slog.Debug("reject: could not write 503", "reason", reason, "error", err)
-	}
 }
 
 // safeHandleConnection wraps handleConnection with panic recovery.
@@ -1074,23 +960,19 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 		}
 	}
 
-	// Response state shared with the panic handler below: once the SSE headers
-	// are on the wire a status line can no longer be sent.
-	var lc *lazyHeaderConn
-
 	// Panic recovery with error response to client. This runs after we have
-	// the client connection, so we can send an error before closing.
+	// the client connection, so we can send a 500 error before closing.
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("panic in connection handler", "panic", r, "stack", string(debug.Stack()))
-			if lc != nil && lc.headersSent {
-				// Headers already sent: a status line would corrupt the SSE body.
-				if err := backends.SendSSEError(clientConn, "internal server error"); err != nil {
-					slog.Debug("failed to send SSE error after panic", "error", err)
-				}
-				return
-			}
-			if _, err := writeErrorResponse(clientConn, "500 Internal Server Error", "Internal server error\n"); err != nil {
+			// Attempt to send error response to client. This may fail if
+			// headers were already sent, but we try anyway for better UX.
+			errorResponse := "HTTP/1.1 500 Internal Server Error\r\n" +
+				"Content-Type: text/plain\r\n" +
+				"Connection: close\r\n" +
+				"\r\n" +
+				"Internal server error\n"
+			if _, err := clientConn.Write([]byte(errorResponse)); err != nil {
 				slog.Error("failed to send error response to client", "error", err)
 			}
 		}
@@ -1104,24 +986,22 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 	if len(trimmedData) > 0 {
 		slog.Debug("socket handoff received", "bytes", len(trimmedData))
 		if err := json.Unmarshal(trimmedData, &handoff); err != nil {
-			// Do not fall through to a default stream: the caller asked for
-			// something specific and we could not understand it.
 			slog.Error("failed to parse handoff data", "error", err, "bytes", len(trimmedData))
-			if _, writeErr := writeErrorResponse(clientConn, "400 Bad Request", "Malformed handoff data\n"); writeErr != nil {
-				slog.Debug("failed to write 400 response", "error", writeErr)
-			}
-			return
 		}
 	} else {
-		slog.Debug("socket handoff received with empty data")
+		slog.Info("socket handoff received with empty data")
 	}
 
 	// Resolve image paths to inline base64 data
 	if err := resolveImages(&handoff, dataDir); err != nil {
 		slog.Error("image resolution failed", "error", err)
-		discardStagedFiles(&handoff, dataDir)
-		if _, writeErr := writeErrorResponse(clientConn, "400 Bad Request", "Image path not allowed\n"); writeErr != nil {
-			slog.Debug("failed to write 400 response", "error", writeErr)
+		errorResponse := "HTTP/1.1 400 Bad Request\r\n" +
+			"Content-Type: text/plain\r\n" +
+			"Connection: close\r\n" +
+			"\r\n" +
+			"Image path not allowed\n"
+		if _, writeErr := clientConn.Write([]byte(errorResponse)); writeErr != nil {
+			slog.Error("failed to write 400 response", "error", writeErr)
 		}
 		return
 	}
@@ -1129,9 +1009,13 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 	// Resolve generalized attachments (text files, images, etc.)
 	if err := resolveAttachments(&handoff, dataDir); err != nil {
 		slog.Error("attachment resolution failed", "error", err)
-		discardStagedFiles(&handoff, dataDir)
-		if _, writeErr := writeErrorResponse(clientConn, "400 Bad Request", "Attachment not allowed\n"); writeErr != nil {
-			slog.Debug("failed to write 400 response", "error", writeErr)
+		errorResponse := "HTTP/1.1 400 Bad Request\r\n" +
+			"Content-Type: text/plain\r\n" +
+			"Connection: close\r\n" +
+			"\r\n" +
+			"Attachment not allowed\n"
+		if _, writeErr := clientConn.Write([]byte(errorResponse)); writeErr != nil {
+			slog.Error("failed to write 400 response", "error", writeErr)
 		}
 		return
 	}
@@ -1145,19 +1029,6 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 		streamCtx, streamCancel = context.WithCancel(ctx)
 	}
 	defer streamCancel()
-
-	// Detect client disconnect while upstream is silent. Nothing else ever
-	// reads the client socket, so without this a client that goes away during
-	// a long upstream pause keeps the LLM run alive until the next write fails
-	// (or max_stream_duration). Apache already consumed the request and the
-	// response says Connection: close, so any EOF or error here means "gone".
-	// Draining also keeps the eventual close() a FIN rather than a RST.
-	var clientClosed atomic.Bool
-	go func() {
-		_, _ = io.Copy(io.Discard, clientConn)
-		clientClosed.Store(true)
-		streamCancel()
-	}()
 
 	// Stream response to client
 	if *benchmarkMode {
@@ -1179,46 +1050,24 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 	}
 
 	streamStart := time.Now()
-	slog.Debug("stream request", "assistant_id", handoff.AssistantID, "thread_id", handoff.ThreadID, "backend", handoff.Backend)
-
-	// Accounting runs in a defer so a panic inside a backend (recovered above)
-	// cannot leave the active-stream gauges permanently inflated. err starts
-	// non-nil so a panic is counted as a failure.
-	var bytesSent int64
-	err = errStreamPanicked
-	defer func() {
-		if *benchmarkMode {
-			benchStats.streamEnd(err == nil, bytesSent)
-			return
+	slog.Info("stream request", "assistant_id", handoff.AssistantID, "thread_id", handoff.ThreadID)
+	bytesSent, err := streamToClientWithBytes(streamCtx, clientConn, handoff)
+	success := err == nil
+	if err != nil {
+		if !*benchmarkMode {
+			metricStreamErrors.WithLabelValues(classifyError(err)).Inc()
 		}
+		slog.Error("stream error", "error", err)
+	}
+
+	if *benchmarkMode {
+		benchStats.streamEnd(success, bytesSent)
+	} else {
 		current := atomic.AddInt64(&activeStreams, -1)
 		metricActiveStreams.Set(float64(current))
 		metricStreamDuration.Observe(time.Since(streamStart).Seconds())
-		if err != nil {
-			metricStreamErrors.WithLabelValues(classifyError(err)).Inc()
-		}
-	}()
-
-	lc = &lazyHeaderConn{Conn: clientConn, handoff: handoff}
-	bytesSent, err = streamToClientWithBytes(streamCtx, lc, handoff)
-	if err != nil {
-		if errors.Is(err, context.Canceled) && clientClosed.Load() {
-			err = errClientDisconnected
-		}
-		if errors.Is(err, errClientDisconnected) {
-			slog.Info("client disconnected", "bytes_sent", bytesSent, "duration", time.Since(streamStart))
-		} else {
-			slog.Error("stream error", "error", err, "bytes_sent", bytesSent)
-		}
 	}
 }
-
-// errClientDisconnected marks streams that ended because the client went away.
-var errClientDisconnected = errors.New("client disconnected")
-
-// errStreamPanicked is the initial stream error so that a panic inside a
-// backend is counted as a failure by the deferred accounting.
-var errStreamPanicked = errors.New("stream panicked")
 
 // receiveFd receives a file descriptor and data from the Unix socket connection.
 // Apache sends the client socket fd via SCM_RIGHTS along with the handoff data.
@@ -1229,7 +1078,7 @@ func receiveFd(conn net.Conn) (int, []byte, error) {
 	}
 
 	// Set read deadline for timeout
-	if err := unixConn.SetReadDeadline(time.Now().Add(config.HandoffTimeout)); err != nil {
+	if err := unixConn.SetReadDeadline(time.Now().Add(HandoffTimeout)); err != nil {
 		return -1, nil, fmt.Errorf("could not set read deadline: %w", err)
 	}
 
@@ -1280,7 +1129,7 @@ func receiveFd(conn net.Conn) (int, []byte, error) {
 		closeReceivedFDs()
 		handoffBufPool.Put(bufPtr)
 		oobBufPool.Put(oobPtr)
-		return -1, nil, fmt.Errorf("handoff data truncated (exceeded %d byte buffer); increase MaxHandoffDataSize", config.MaxHandoffDataSize)
+		return -1, nil, fmt.Errorf("handoff data truncated (exceeded %d byte buffer); increase MaxHandoffDataSize", MaxHandoffDataSize)
 	}
 
 	// Check MSG_CTRUNC flag to detect if control message (containing fd) was truncated
@@ -1340,19 +1189,34 @@ func receiveFd(conn net.Conn) (int, []byte, error) {
 	return allFds[0], data, nil
 }
 
-// streamToClientWithBytes runs the resolved backend against conn and returns
-// the total bytes sent (headers + body).
-//
-// conn is normally a *lazyHeaderConn, so the SSE headers go out with the
-// backend's first write. If the backend fails before writing anything, the
-// client gets a real 502/504 status; if it fails mid-stream, the client gets an
-// SSE error event so EventSource consumers can distinguish failure from a
-// normal end of stream.
+// streamToClientWithBytes sends an SSE response and returns bytes sent.
 func streamToClientWithBytes(ctx context.Context, conn net.Conn, handoff backends.HandoffData) (int64, error) {
-	lc, lazy := conn.(*lazyHeaderConn)
-	if !lazy {
-		lc = &lazyHeaderConn{Conn: conn, handoff: handoff}
-		conn = lc
+	var totalBytes int64
+
+	// Set initial write timeout - fail fast if we can't set deadline
+	if err := conn.SetWriteDeadline(time.Now().Add(backends.WriteTimeout)); err != nil {
+		return 0, fmt.Errorf("could not set write deadline: %w", err)
+	}
+
+	// Write directly to conn without buffering for lowest latency SSE streaming.
+	// Each write goes straight to the kernel, minimizing TTFB.
+
+	// Send HTTP headers for SSE. Uses pre-allocated bytes when no custom
+	// response headers are present; otherwise builds headers dynamically.
+	headerBytes, err := writeSSEHeaders(conn, handoff)
+	if err != nil {
+		return totalBytes, fmt.Errorf("failed to write headers: %w", err)
+	}
+	totalBytes += headerBytes
+	if !*benchmarkMode {
+		metricBytesSent.Add(float64(headerBytes))
+	}
+
+	// Check for context cancellation before starting to stream
+	select {
+	case <-ctx.Done():
+		return totalBytes, ctx.Err()
+	default:
 	}
 
 	// Resolve backend: per-request override or default.
@@ -1371,37 +1235,9 @@ func streamToClientWithBytes(ctx context.Context, conn net.Conn, handoff backend
 
 	// Stream the response using the resolved backend
 	bodyBytes, err := b.Stream(ctx, conn, handoff)
-	totalBytes := lc.headerBytes + bodyBytes
-
-	if err != nil && classifyError(err) != "client_disconnected" {
-		if !lc.headersSent {
-			// Nothing reached the client yet: send a real status.
-			status, body := "502 Bad Gateway", "Upstream error\n"
-			if errors.Is(err, context.DeadlineExceeded) {
-				status, body = "504 Gateway Timeout", "Upstream timeout\n"
-			} else if errors.Is(err, context.Canceled) {
-				status, body = "503 Service Unavailable", "Stream cancelled\n"
-			}
-			n, werr := writeErrorResponse(lc.Conn, status, body)
-			totalBytes += n
-			if werr != nil {
-				slog.Debug("failed to write error status", "status", status, "error", werr)
-			}
-		} else {
-			msg := "upstream error"
-			if errors.Is(err, context.DeadlineExceeded) {
-				msg = "stream timed out"
-			} else if errors.Is(err, context.Canceled) {
-				msg = "stream cancelled"
-			}
-			if serr := backends.SendSSEError(lc.Conn, msg); serr != nil {
-				slog.Debug("failed to send SSE error event", "error", serr)
-			}
-		}
-	}
-
-	if !*benchmarkMode && totalBytes > 0 {
-		metricBytesSent.Add(float64(totalBytes))
+	totalBytes += bodyBytes
+	if !*benchmarkMode && bodyBytes > 0 {
+		metricBytesSent.Add(float64(bodyBytes))
 	}
 	return totalBytes, err
 }
@@ -1414,112 +1250,10 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"ok","active_streams":%d,"active_connections":%d}`, streams, conns)
 }
 
-// containedPath resolves p to a symlink-free absolute path and verifies, both
-// on the literal path (catches ../ traversal) and after symlink resolution
-// (catches symlink escape), that it stays inside allowedDir. Relative paths are
-// joined onto allowedDir. outside is true when the containment check failed;
-// any other error means the path could not be resolved (typically a missing
-// file), which callers treat as skippable.
-func containedPath(allowedDir, p string) (resolved string, outside bool, err error) {
-	// Without an absolute allowedDir there is nothing to contain against: a
-	// relative p would silently resolve against the process working directory.
-	if !filepath.IsAbs(allowedDir) {
-		return "", true, fmt.Errorf("%q cannot be resolved: data_dir is not configured", p)
-	}
-	if !filepath.IsAbs(p) {
-		p = filepath.Join(allowedDir, p)
-	}
-	cleaned := filepath.Clean(p)
-
-	// Canonicalize allowedDir so resolved paths compare correctly even when
-	// allowedDir contains symlinks (e.g. /var/run -> /run).
-	if canon, err := filepath.EvalSymlinks(allowedDir); err == nil {
-		allowedDir = canon
-	}
-
-	if !isInside(allowedDir, cleaned) {
-		return "", true, fmt.Errorf("%q is outside allowed directory %q", cleaned, allowedDir)
-	}
-	resolved, err = filepath.EvalSymlinks(cleaned)
-	if err != nil {
-		return "", false, err
-	}
-	if !isInside(allowedDir, resolved) {
-		return "", true, fmt.Errorf("%q resolves outside allowed directory %q", resolved, allowedDir)
-	}
-	return resolved, false, nil
-}
-
-// isInside reports whether path is dir itself or a descendant of it.
-func isInside(dir, path string) bool {
-	rel, err := filepath.Rel(dir, path)
-	if err != nil || filepath.IsAbs(rel) {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
-// readStagedFile reads one staged attachment file with the open-fstat-read
-// pattern and deletes it afterwards (best effort). It enforces the per-file
-// limit maxSize and the per-request budget config.MaxTotalAttachmentBytes,
-// tracked in handoff.StagedBytes. kind names the file class in error messages.
-//
-// Returns skip=true (with a reason) for conditions that should be logged and
-// ignored: open/stat/read failures and non-regular files. Any returned error
-// is fatal for the request; the offending file is removed first.
-//
-// O_NOFOLLOW prevents symlink following on the final component at open time;
-// parent directory swaps remain a theoretical risk (mitigable only with openat
-// on a dirfd, not done here). O_NONBLOCK prevents blocking on FIFOs/devices
-// (rejected by the IsRegular check below); for regular files it is a no-op.
-func readStagedFile(path string, maxSize int64, kind string, handoff *backends.HandoffData) (data []byte, skip error, err error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open failed: %w", err), nil
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat failed: %w", err), nil
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("not a regular file (mode %v)", info.Mode()), nil
-	}
-	size := info.Size()
-	if size > maxSize {
-		os.Remove(path) // best-effort cleanup of staged file
-		return nil, nil, fmt.Errorf("%s exceeds %d byte limit (got %d)", kind, maxSize, size)
-	}
-	if handoff.StagedBytes+size > config.MaxTotalAttachmentBytes {
-		os.Remove(path)
-		return nil, nil, fmt.Errorf("total attachment size exceeds %d byte limit", config.MaxTotalAttachmentBytes)
-	}
-
-	// Use LimitReader to bound memory even if the file grows after stat
-	data, err = io.ReadAll(io.LimitReader(f, maxSize+1))
-	if int64(len(data)) > maxSize {
-		os.Remove(path)
-		return nil, nil, fmt.Errorf("%s exceeds %d byte limit during read", kind, maxSize)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read failed: %w", err), nil
-	}
-	handoff.StagedBytes += int64(len(data))
-
-	// Best-effort delete by symlink-resolved path
-	if err := os.Remove(path); err != nil {
-		slog.Warn("staged file delete failed", "path", path, "error", err)
-	}
-	return data, nil, nil
-}
-
 // resolveImages populates handoff.ResolvedImages from inline images and file paths.
 // Legacy single-image fields are migrated to the plural fields for backward compatibility.
-// Relative image paths are resolved under allowedDir (like attachments); absolute
-// paths must already lie inside it. Files are read, base64-encoded, and deleted
-// (best-effort). Returns error for path traversal violations and oversized files;
-// other file read errors are logged and skipped.
+// Files are read, base64-encoded, and deleted (best-effort). Returns error for path
+// traversal violations and oversized files; other file read errors are logged and skipped.
 func resolveImages(handoff *backends.HandoffData, allowedDir string) error {
 	// Migrate legacy single-image fields
 	if handoff.ImageBase64 != "" {
@@ -1545,130 +1279,89 @@ func resolveImages(handoff *backends.HandoffData, allowedDir string) error {
 	// Copy inline images to ResolvedImages
 	handoff.ResolvedImages = append(handoff.ResolvedImages, handoff.Images...)
 
-	if len(handoff.ImagePaths) == 0 {
-		return nil
-	}
-	// Fail fast if data_dir is not configured (same rule as attachments)
-	if !filepath.IsAbs(allowedDir) {
-		return fmt.Errorf("data_dir is not configured (required for image_paths)")
+	// Canonicalize allowedDir so resolved paths compare correctly even when
+	// allowedDir contains symlinks (e.g. /var/run -> /run).
+	if allowedDir != "" {
+		if canon, err := filepath.EvalSymlinks(allowedDir); err == nil {
+			allowedDir = canon
+		}
 	}
 
 	// Load file images
 	for _, path := range handoff.ImagePaths {
-		resolved, outside, err := containedPath(allowedDir, path)
-		if outside {
-			return fmt.Errorf("image path %w", err)
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			slog.Warn("image path abs failed", "path", path, "error", err)
+			continue
+		}
+		cleaned := filepath.Clean(absPath)
+		// First containment check on the literal path (catches ../ traversal)
+		rel, relErr := filepath.Rel(allowedDir, cleaned)
+		if relErr != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("image path %q is outside allowed directory %q", cleaned, allowedDir)
+		}
+
+		// Resolve symlinks in all path components and re-check containment
+		resolved, err := filepath.EvalSymlinks(cleaned)
+		if err != nil {
+			slog.Warn("image file resolve failed", "path", cleaned, "error", err)
+			continue
+		}
+		rel, relErr = filepath.Rel(allowedDir, resolved)
+		if relErr != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("image path %q resolves outside allowed directory %q", resolved, allowedDir)
+		}
+		cleaned = resolved
+
+		// Open-fstat-read pattern matching resolveAttachments() security
+		f, err := os.OpenFile(cleaned, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			slog.Warn("image file open failed", "path", cleaned, "error", err)
+			continue
+		}
+		info, err := f.Stat()
+		if err != nil {
+			f.Close()
+			slog.Warn("image file stat failed", "path", cleaned, "error", err)
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			f.Close()
+			slog.Warn("image is not a regular file", "path", cleaned, "mode", info.Mode())
+			continue
+		}
+		if info.Size() > maxBinaryFileSize {
+			f.Close()
+			os.Remove(cleaned) // best-effort cleanup of staged file
+			return fmt.Errorf("image %q exceeds %d byte limit (got %d)", cleaned, maxBinaryFileSize, info.Size())
+		}
+
+		data, err := io.ReadAll(io.LimitReader(f, maxBinaryFileSize+1))
+		f.Close()
+		if int64(len(data)) > maxBinaryFileSize {
+			os.Remove(cleaned) // best-effort cleanup of staged file
+			return fmt.Errorf("image %q exceeds %d byte limit during read", cleaned, maxBinaryFileSize)
 		}
 		if err != nil {
-			slog.Warn("image file resolve failed", "path", path, "error", err)
+			slog.Warn("image file read failed", "path", cleaned, "error", err)
 			continue
 		}
 
-		data, skip, err := readStagedFile(resolved, maxBinaryFileSize, "image", handoff)
-		if err != nil {
-			return fmt.Errorf("image %q: %w", resolved, err)
-		}
-		if skip != nil {
-			slog.Warn("image file skipped", "path", resolved, "reason", skip)
-			continue
+		encoded := base64.StdEncoding.EncodeToString(data)
+		mime := mimeTypeFromExt(filepath.Ext(cleaned))
+
+		// Best-effort delete
+		if err := os.Remove(cleaned); err != nil {
+			slog.Warn("image file delete failed", "path", cleaned, "error", err)
 		}
 
 		handoff.ResolvedImages = append(handoff.ResolvedImages, backends.ImageData{
-			Base64:   base64.StdEncoding.EncodeToString(data),
-			MimeType: mimeTypeFromExt(filepath.Ext(resolved)),
+			Base64:   encoded,
+			MimeType: mime,
 		})
 	}
 
 	return nil
-}
-
-// discardStagedFiles removes every image and attachment file referenced by a
-// handoff that will not be served (parse failure, rejected attachment, ...).
-// Files are normally deleted as they are consumed, but a request that fails on
-// its second attachment would otherwise leave the rest on disk until the
-// sweeper runs. Only regular files inside allowedDir are touched.
-func discardStagedFiles(handoff *backends.HandoffData, allowedDir string) {
-	if !filepath.IsAbs(allowedDir) {
-		return
-	}
-	paths := make([]string, 0, len(handoff.ImagePaths)+len(handoff.Attachments)+1)
-	paths = append(paths, handoff.ImagePaths...)
-	if handoff.ImagePath != "" {
-		paths = append(paths, handoff.ImagePath)
-	}
-	for _, rel := range handoff.Attachments {
-		paths = append(paths, filepath.Join(allowedDir, rel))
-	}
-	for _, p := range paths {
-		resolved, outside, err := containedPath(allowedDir, p)
-		if outside || err != nil {
-			continue
-		}
-		info, err := os.Lstat(resolved)
-		if err != nil || !info.Mode().IsRegular() {
-			continue
-		}
-		if err := os.Remove(resolved); err == nil {
-			slog.Debug("discarded staged file", "path", resolved)
-		}
-	}
-}
-
-// runDataDirSweeper periodically removes stale regular files from dir until
-// ctx is cancelled. It is the safety net for staged files whose request never
-// reached attachment resolution (malformed JSON, rejected at capacity, daemon
-// restart between PHP writing the file and the handoff arriving).
-func runDataDirSweeper(ctx context.Context, dir string, maxAge time.Duration) {
-	interval := maxAge / 2
-	if interval < 10*time.Second {
-		interval = 10 * time.Second
-	}
-	slog.Info("data directory sweeper started", "dir", dir, "max_age", maxAge, "interval", interval)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			sweepDataDir(dir, maxAge)
-		}
-	}
-}
-
-// sweepDataDir removes regular files directly under dir whose modification
-// time is older than maxAge. Subdirectories, sockets and symlinks are ignored.
-// Returns the number of files removed.
-func sweepDataDir(dir string, maxAge time.Duration) int {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		slog.Warn("data directory sweep failed", "dir", dir, "error", err)
-		return 0
-	}
-	cutoff := time.Now().Add(-maxAge)
-	removed := 0
-	for _, e := range entries {
-		if !e.Type().IsRegular() {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil || info.ModTime().After(cutoff) {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		if err := os.Remove(path); err != nil {
-			if !os.IsNotExist(err) {
-				slog.Warn("could not remove stale staged file", "path", path, "error", err)
-			}
-			continue
-		}
-		slog.Debug("removed stale staged file", "path", path, "age", time.Since(info.ModTime()))
-		removed++
-	}
-	if removed > 0 {
-		slog.Info("swept stale staged files", "dir", dir, "removed", removed, "older_than", maxAge)
-	}
-	return removed
 }
 
 // mimeTypeFromExt returns the MIME type for a file extension.
@@ -1766,17 +1459,35 @@ func resolveAttachments(handoff *backends.HandoffData, allowedDir string) error 
 		return fmt.Errorf("data_dir is not configured (required for attachments)")
 	}
 
+	// Canonicalize allowedDir so resolved paths compare correctly even when
+	// allowedDir contains symlinks (e.g. /var/run -> /run).
+	if canon, err := filepath.EvalSymlinks(allowedDir); err == nil {
+		allowedDir = canon
+	}
+
 	handoff.ResolvedAttachments = make(map[string]backends.ResolvedAttachment, len(handoff.Attachments))
 
 	for refName, relPath := range handoff.Attachments {
-		resolved, outside, err := containedPath(allowedDir, filepath.Join(allowedDir, relPath))
-		if outside {
-			return fmt.Errorf("attachment path (ref %q) %w", refName, err)
+		absPath := filepath.Join(allowedDir, relPath)
+		cleaned := filepath.Clean(absPath)
+
+		// First containment check on the literal path (catches ../ traversal)
+		rel, relErr := filepath.Rel(allowedDir, cleaned)
+		if relErr != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("attachment path %q (ref %q) is outside allowed directory", cleaned, refName)
 		}
+
+		// Resolve symlinks and re-check containment (catches symlink escape)
+		resolved, err := filepath.EvalSymlinks(cleaned)
 		if err != nil {
-			slog.Warn("attachment file resolve failed", "ref", refName, "path", relPath, "error", err)
+			slog.Warn("attachment file resolve failed", "ref", refName, "path", cleaned, "error", err)
 			continue
 		}
+		rel, relErr = filepath.Rel(allowedDir, resolved)
+		if relErr != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("attachment path %q (ref %q) resolves outside allowed directory", resolved, refName)
+		}
+		cleaned = resolved
 
 		// Determine MIME type: explicit override from attachment_types, or detect from extension
 		var mimeType string
@@ -1793,35 +1504,83 @@ func resolveAttachments(handoff *backends.HandoffData, allowedDir string) error 
 			isText = mimeIsText(override)
 		} else {
 			var err error
-			mimeType, isText, err = fileTypeFromExt(filepath.Ext(resolved))
+			mimeType, isText, err = fileTypeFromExt(filepath.Ext(cleaned))
 			if err != nil {
-				os.Remove(resolved) // best-effort cleanup of staged file
+				os.Remove(cleaned) // best-effort cleanup of staged file
 				return fmt.Errorf("attachment %q: %w", refName, err)
 			}
 		}
 
-		maxSize, kind := int64(maxBinaryFileSize), "binary file"
-		if isText {
-			maxSize, kind = maxTextFileSize, "text file"
-		}
-		data, skip, err := readStagedFile(resolved, maxSize, kind, handoff)
+		// Best-effort open-fstat-read pattern to reduce the TOCTOU window between
+		// path checks and read. O_NOFOLLOW prevents symlink following on the final
+		// component at open time; parent directory swaps remain a theoretical risk
+		// (mitigable only with openat on a dirfd, not done here). O_NONBLOCK
+		// prevents blocking on FIFOs/devices (rejected by the IsRegular check
+		// below). For regular files, O_NONBLOCK has no effect on Linux.
+		f, err := os.OpenFile(cleaned, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 		if err != nil {
-			return fmt.Errorf("attachment %q: %w", refName, err)
-		}
-		if skip != nil {
-			slog.Warn("attachment file skipped", "ref", refName, "path", resolved, "reason", skip)
+			slog.Warn("attachment file open failed", "ref", refName, "path", cleaned, "error", err)
 			continue
 		}
 
-		att := backends.ResolvedAttachment{MimeType: mimeType, IsText: isText}
+		info, err := f.Stat()
+		if err != nil {
+			f.Close()
+			slog.Warn("attachment file stat failed", "ref", refName, "path", cleaned, "error", err)
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			f.Close()
+			slog.Warn("attachment is not a regular file", "ref", refName, "path", cleaned, "mode", info.Mode())
+			continue
+		}
+		size := info.Size()
+		if isText && size > maxTextFileSize {
+			f.Close()
+			os.Remove(cleaned) // best-effort cleanup of staged file
+			return fmt.Errorf("attachment %q: text file exceeds %d byte limit (got %d)", refName, maxTextFileSize, size)
+		}
+		if !isText && size > maxBinaryFileSize {
+			f.Close()
+			os.Remove(cleaned) // best-effort cleanup of staged file
+			return fmt.Errorf("attachment %q: binary file exceeds %d byte limit (got %d)", refName, maxBinaryFileSize, size)
+		}
+
+		// Use LimitReader to bound memory even if the file grows after stat
+		maxSize := int64(maxBinaryFileSize)
+		if isText {
+			maxSize = int64(maxTextFileSize)
+		}
+		data, err := io.ReadAll(io.LimitReader(f, maxSize+1))
+		f.Close()
+		if int64(len(data)) > maxSize {
+			os.Remove(cleaned) // best-effort cleanup of staged file
+			return fmt.Errorf("attachment %q: file exceeds %d byte limit during read", refName, maxSize)
+		}
+		if err != nil {
+			slog.Warn("attachment file read failed", "ref", refName, "path", cleaned, "error", err)
+			continue
+		}
+
+		var att backends.ResolvedAttachment
+		att.MimeType = mimeType
+		att.IsText = isText
+
 		if isText {
 			if !utf8.Valid(data) {
+				os.Remove(cleaned) // best-effort cleanup of staged file
 				return fmt.Errorf("attachment %q: text file contains invalid UTF-8", refName)
 			}
 			att.Text = string(data)
 		} else {
 			att.Base64 = base64.StdEncoding.EncodeToString(data)
 		}
+
+		// Best-effort delete by symlink-resolved path
+		if err := os.Remove(cleaned); err != nil {
+			slog.Warn("attachment file delete failed", "ref", refName, "path", cleaned, "error", err)
+		}
+
 		handoff.ResolvedAttachments[refName] = att
 	}
 
@@ -1833,11 +1592,6 @@ func resolveAttachments(handoff *backends.HandoffData, allowedDir string) error 
 func classifyError(err error) string {
 	if err == nil {
 		return "none"
-	}
-	// Streams cut short because the client went away are rewritten to this
-	// sentinel in handleConnection; check it before the generic context error.
-	if errors.Is(err, errClientDisconnected) {
-		return "client_disconnected"
 	}
 	// Use errors.Is for context errors (handles wrapped errors)
 	if errors.Is(err, context.Canceled) {
