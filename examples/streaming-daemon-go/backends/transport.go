@@ -15,14 +15,6 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// HTTP/2 liveness settings. Without a read-idle ping, a peer that vanishes
-// without RST (NAT timeout, crashed VM, dropped VPN) leaves every stream on
-// that connection blocked in Read until the per-stream max duration expires.
-const (
-	http2ReadIdleTimeout = 30 * time.Second // send a PING after this much read inactivity
-	http2PingTimeout     = 15 * time.Second // close the connection if the PING is not answered
-)
-
 // TransportConfig holds settings for creating an HTTP transport.
 type TransportConfig struct {
 	BaseURL     string // API base URL (determines protocol: http:// or https://)
@@ -47,10 +39,8 @@ func NewHTTPClient(cfg TransportConfig) *http.Client {
 		roundTripper = &http2.Transport{
 			AllowHTTP:          true,
 			DisableCompression: true,
-			ReadIdleTimeout:    http2ReadIdleTimeout,
-			PingTimeout:        http2PingTimeout,
 			DialTLSContext: func(ctx context.Context, network, addr string, tlsCfg *tls.Config) (net.Conn, error) {
-				d := net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+				d := net.Dialer{KeepAlive: 30 * time.Second}
 				return d.DialContext(ctx, network, addr)
 			},
 		}
@@ -61,7 +51,7 @@ func NewHTTPClient(cfg TransportConfig) *http.Client {
 		if cfg.InsecureSSL {
 			tlsConfig.InsecureSkipVerify = true
 		}
-		t1 := &http.Transport{
+		roundTripper = &http.Transport{
 			TLSClientConfig:     tlsConfig,
 			ForceAttemptHTTP2:   true,
 			MaxIdleConns:        100,
@@ -72,14 +62,6 @@ func NewHTTPClient(cfg TransportConfig) *http.Client {
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
 		}
-		// Reach into the bundled HTTP/2 transport to enable liveness pings.
-		if t2, err := http2.ConfigureTransports(t1); err == nil {
-			t2.ReadIdleTimeout = http2ReadIdleTimeout
-			t2.PingTimeout = http2PingTimeout
-		} else {
-			slog.Warn("could not configure HTTP/2 transport; liveness pings disabled", "backend", cfg.Label, "error", err)
-		}
-		roundTripper = t1
 		slog.Info("backend transport configured", "backend", cfg.Label, "url", cfg.BaseURL, "mode", "HTTP/2 ALPN")
 	} else if cfg.SocketPath != "" {
 		// HTTP/1.1 with Unix socket for high-concurrency
