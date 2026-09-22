@@ -97,6 +97,13 @@ type HandoffData struct {
 	// Per-request backend selection (overrides the daemon's default provider)
 	Backend string `json:"backend,omitempty"`
 
+	// Convos connection-monitor fields (noop-monitor backend).
+	// Source labels the originating surface ("detail"|"message_list") for
+	// per-surface metrics. ConnectionID is a correlation id for optional
+	// per-connection debug logging only; neither has a functional consumer.
+	Source       string `json:"source,omitempty"`
+	ConnectionID string `json:"connection_id,omitempty"`
+
 	// Image and attachment file paths — daemon reads, base64-encodes, and deletes
 	ImagePaths []string `json:"image_paths,omitempty"`
 

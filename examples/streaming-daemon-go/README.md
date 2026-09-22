@@ -14,7 +14,7 @@ This daemon receives client connections from Apache via `mod_socket_handoff` usi
 
 ## Features
 
-- **Backend plugin architecture** - Extensible backends (langgraph, mock, openai, typing) with Caddy-style `init()` registration
+- **Backend plugin architecture** - Extensible backends (langgraph, mock, noop-monitor, openai, typing) with Caddy-style `init()` registration
 - **YAML configuration** - Optional config file with flag overrides
 - **Goroutine-per-connection** - Lightweight concurrency for high throughput
 - **SCM_RIGHTS fd receiving** - Portable buffer sizing with `syscall.CmsgSpace`
@@ -104,6 +104,7 @@ The daemon supports multiple streaming backends via a plugin architecture. Backe
 |---------|-------------|----------|
 | `langgraph` | LangGraph Platform API | Stateful agents with conversation threads |
 | `mock` | Fixed demo messages with configurable delay | Testing, benchmarking |
+| `noop-monitor` | Holds the connection open, sends nothing | Connection volume/concurrency/duration measurement |
 | `openai` | OpenAI-compatible streaming API | GPT-4, Groq, Ollama, any OpenAI-compatible API |
 | `typing` | Character-by-character typewriter effect | Demos, fortune integration |
 
@@ -232,6 +233,23 @@ Streams characters one at a time with realistic typing delays. Uses `/usr/games/
 ```bash
 ./streaming-daemon -backend typing
 ```
+
+### Noop Monitor Backend
+
+Holds a handed-off connection open and sends only periodic `: ping` SSE keepalives — no LLM, no message data, no per-user logging. Its purpose is measurement: connection volume, concurrency, and duration are read straight from this daemon's Prometheus metrics. Intended to run as a dedicated monitor instance on its own socket and metrics port.
+
+```bash
+./streaming-daemon -backend noop-monitor -socket /run/streaming-daemon/convos-monitor.sock
+```
+
+Config (`backend.noop_monitor.ping_interval_ms`, default `25000`) sets the keepalive interval; the keepalive doubles as client-disconnect detection since a write-only stream only learns the client left when a write fails. `server.max_stream_duration_ms` optionally caps connection lifetime (`0` = hold indefinitely).
+
+Besides the daemon-level metrics, it exposes two low-cardinality series:
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `noop_monitor_active` | gauge | `source` | Currently held connections by surface (`detail`, `message_list`, `other`) |
+| `noop_monitor_closed_total` | counter | `source`, `reason` | Closed connections by surface and reason (`client_disconnect`, `max_lifetime`, `shutdown`) |
 
 ### Adding New Backends
 
